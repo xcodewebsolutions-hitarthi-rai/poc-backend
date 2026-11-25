@@ -1,0 +1,262 @@
+package com.yonyou.ucf.mdf.expsintegration.example.service.impl;
+
+import cn.hutool.core.bean.BeanUtil;
+import com.alibaba.fastjson.JSONArray;
+import com.alibaba.fastjson.JSONObject;
+import com.yonyou.ucf.mdd.ext.exceptions.BusinessException;
+import com.yonyou.ucf.mdf.expsintegration.example.service.IExternalPaymentBill;
+import com.yonyou.ucf.mdf.expsintegration.example.service.impl.externalpaymentconvert.HandleConvert;
+import com.yonyou.ypd.bill.infrastructure.service.api.IBillQueryRepository;
+import com.yonyou.ypd.bill.basic.bean.JsonResult;
+import lombok.extern.slf4j.Slf4j;
+import org.apache.commons.lang3.ObjectUtils;
+import org.apache.commons.lang3.StringUtils;
+import org.imeta.orm.schema.QueryCondition;
+import org.imeta.orm.schema.QuerySchema;
+import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.stereotype.Service;
+
+import java.util.List;
+import java.util.Map;
+import java.util.UUID;
+
+/**
+ * 对外通用付款单服务实现
+ * 负责第三方系统数据录入BIP费控单据
+ *
+ * 保存方式：通过OpenAPI调用BIP保存接口（非iDoOpenApi）
+ * 字段定义：从OpenAPI接口获取
+ * 认证方式：AccessToken（appKey/appSecret获取）
+ */
+@Slf4j
+@Service
+public class ExternalPaymentBillServiceImpl implements IExternalPaymentBill {
+
+    private static final String BILL_URI = "znbzbx.commonexpensebill.CommonExpenseBillVO";
+
+    @Autowired
+    private HandleConvert handleConvert;
+
+    @Autowired
+    private IBillQueryRepository billQueryRepository;
+
+    @Autowired
+    private AccessTokenProvider accessTokenProvider;
+
+    @Autowired
+    private OpenApiClient openApiClient;
+
+    @Autowired
+    private IntegrationProperties integrationProperties;
+
+    public interface AccessTokenProvider {
+        String getAccessToken(String baseUrl, String appKey, String appSecret);
+
+        String getAccessToken(String tenantId, String baseUrl, String appKey, String appSecret);
+    }
+
+    public interface OpenApiClient {
+        String post(Map<String, Object> params, String requestUrl, String accessToken);
+    }
+
+    public interface IntegrationProperties {
+        String getTenantId();
+
+        String getBaseUrl();
+
+        String getAppKey();
+
+        String getAppSecret();
+
+        String getSaveUrl();
+    }
+
+    /**
+     * 保存/修改对外通用付款单
+     * 通过OpenAPI调用BIP保存接口
+     */
+    @Override
+    public JsonResult saveExternalPaymentBill(Map<String, Object> dataMap) throws Exception {
+        JSONObject dataReq = new JSONObject(dataMap);
+        JSONObject data = dataReq.getJSONObject("data");
+        JSONObject req = new JSONObject();
+
+        log.info("通用报销单保存，请求参数：{}", dataReq);
+
+        String status = data.getString("_status");
+        JSONObject ex = data.getJSONObject("expensebillDcs");
+
+        // ============ 1. 唯一性校验（使用IBillQueryRepository） ============
+        if (ex != null && !ex.isEmpty()) {
+            String sourcebillno = ex.getString("MY_FK_0008");
+            if (StringUtils.isEmpty(sourcebillno)) {
+                throw new BusinessException("来源MY_FK_0008单号为空！");
+            }
+
+            if ("Insert".equals(status)) {
+                String existingId = findExistingBillId(sourcebillno);
+                if (existingId != null) {
+                    throw new BusinessException(
+                        "数据重复，请先在BIP删除数据后重新推送，sourcebillno单号为：" + sourcebillno);
+                }
+            }
+        }
+
+        // ============ 2. 数据转换 ============
+        if ("Insert".equals(status)) {
+            String billNo = ObjectUtils.isNotEmpty(data.get("code")) ? data.get("code").toString() : null;
+            String existingId = findExistingBillId(billNo);
+            if (existingId != null) {
+                throw new BusinessException("数据已存在，不允许新增！");
+            }
+
+            if (ObjectUtils.isNotEmpty(data.getString("bustype"))) {
+                String bustype = data.getString("bustype");
+                handleConvert.dataConvert(bustype, data, req);
+            } else {
+                throw new BusinessException("交易类型不明确！");
+            }
+        } else {
+            if (ObjectUtils.isNotEmpty(data.getString("bustype"))) {
+                BeanUtil.copyProperties(data, req);
+                String bustype = data.getString("bustype");
+                handleConvert.dataConvert(bustype, data, req);
+            } else {
+                throw new BusinessException("交易类型不明确！");
+            }
+        }
+
+        // ============ 3. 通过OpenAPI保存 ============
+        try {
+            String billId = saveByOpenApi(req);
+            log.info("通用报销单保存成功，billId={}", billId);
+
+            JSONObject resultData = new JSONObject();
+            resultData.put("billId", billId);
+            if (ex != null) {
+                resultData.put("sourceBillNo", ex.getString("MY_FK_0008"));
+            }
+
+            JsonResult jsonResult = new JsonResult();
+            jsonResult.setCode(200);
+            jsonResult.setData(resultData);
+            jsonResult.setMessage("保存成功");
+            return jsonResult;
+
+        } catch (BusinessException e) {
+            throw e;
+        } catch (Exception e) {
+            log.error("ExternalPaymentBillService#save error", e);
+            throw new BusinessException("ExternalPaymentBillService#save error: " + e.getMessage());
+        }
+    }
+
+    /**
+     * 批量保存外部付款单
+     */
+    @Override
+    public JsonResult batchSaveExternalPaymentBill(Map<String, Object> dataMap) throws Exception {
+        JSONObject dataReq = new JSONObject(dataMap);
+        JSONArray dataList = dataReq.getJSONArray("data");
+
+        if (dataList == null || dataList.isEmpty()) {
+            throw new BusinessException("批量数据不能为空！");
+        }
+
+        int successCount = 0;
+        int failCount = 0;
+        StringBuilder errorMsg = new StringBuilder();
+
+        for (int i = 0; i < dataList.size(); i++) {
+            try {
+                JSONObject itemData = dataList.getJSONObject(i);
+                Map<String, Object> itemMap = itemData.toJavaObject(Map.class);
+                saveExternalPaymentBill(itemMap);
+                successCount++;
+            } catch (Exception e) {
+                failCount++;
+                errorMsg.append("第").append(i + 1).append("条数据保存失败：")
+                     .append(e.getMessage()).append(";");
+            }
+        }
+
+        JsonResult result = new JsonResult();
+        result.setCode(failCount == 0 ? 200 : 206);
+        result.setMessage("成功" + successCount + "条，失败" + failCount + "条");
+
+        return result;
+    }
+
+    /**
+     * 通过OpenAPI保存单据
+     * 使用AccessToken认证，标准OpenAPI调用格式
+     */
+    private String saveByOpenApi(JSONObject billData) {
+        try {
+            // 1. 获取AccessToken（带缓存，支持多租户）
+            String accessToken;
+            String tenantId = integrationProperties.getTenantId();
+            String baseUrl = integrationProperties.getBaseUrl();
+            String appKey = integrationProperties.getAppKey();
+            String appSecret = integrationProperties.getAppSecret();
+
+            if (StringUtils.isNotBlank(tenantId)) {
+                accessToken = accessTokenProvider.getAccessToken(tenantId, baseUrl, appKey, appSecret);
+            } else {
+                accessToken = accessTokenProvider.getAccessToken(baseUrl, appKey, appSecret);
+            }
+
+            // 2. 构建OpenAPI请求参数 - 标准格式: { "data": { ... } }
+            billData.put("resubmitCheckKey", UUID.randomUUID().toString().replace("-", ""));
+            Map<String, Object> params = new java.util.HashMap<>();
+            params.put("data", billData);
+
+            // 3. 调用OpenAPI保存
+            String requestUrl = integrationProperties.getSaveUrl();
+            String result = openApiClient.post(params, requestUrl, accessToken);
+
+            // 4. 解析响应 - OpenAPI成功码: "00000"
+            JSONObject resultJson = JSONObject.parseObject(result);
+            if ("00000".equals(resultJson.getString("code"))) {
+                String resultBillId = null;
+                if (resultJson.containsKey("data") && resultJson.get("data") != null) {
+                    JSONObject data = resultJson.getJSONObject("data");
+                    if (data.containsKey("id")) {
+                        resultBillId = data.getString("id");
+                    } else if (data.containsKey("billId")) {
+                        resultBillId = data.getString("billId");
+                    }
+                }
+                return resultBillId;
+            } else {
+                String message = resultJson.getString("message");
+                throw new BusinessException("OpenAPI保存失败：" + message);
+            }
+        } catch (BusinessException e) {
+            throw e;
+        } catch (Exception e) {
+            log.error("OpenAPI保存异常", e);
+            throw new BusinessException("OpenAPI保存异常：" + e.getMessage());
+        }
+    }
+
+    /**
+     * 查询已存在单据（使用IBillQueryRepository）
+     * 用于幂等性判断
+     */
+    private String findExistingBillId(String code) {
+        if (StringUtils.isEmpty(code)) {
+            return null;
+        }
+        QuerySchema querySchema = QuerySchema.create();
+        querySchema.addSelect("id");
+        querySchema.appendQueryCondition(QueryCondition.name("code").eq(code));
+
+        List<Map<String, Object>> result = billQueryRepository.queryMapBySchema(BILL_URI, querySchema, "znbzbx");
+        if (result != null && !result.isEmpty()) {
+            Object id = result.get(0).get("id");
+            return id != null ? id.toString() : null;
+        }
+        return null;
+    }
+}

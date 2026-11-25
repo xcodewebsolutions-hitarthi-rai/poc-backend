@@ -1,0 +1,73 @@
+# 事件订阅查询技能配置
+#
+# 功能:
+#   - 根据名称查询 BIP 事件类型
+#   - 获取事件订阅详情
+#   - 解析事件报文结构
+#
+# 安全建议:
+#   - app_secret 等敏感信息请使用环境变量
+#   - 示例: app_secret: "${API_APP_SECRET}" 或 "${API_APP_SECRET:-fallback}"
+
+paths:
+  output_dir: "output"
+
+# 开放平台鉴权配置
+api:
+  # API 基址（可通过环境变量覆盖）
+  base_url: "${API_BASE_URL:-https://v5devkk1.yonyoucloud.com}"
+
+  # 应用密钥（建议使用环境变量）
+  app_key: "${API_APP_KEY}"
+  app_secret: "${API_APP_SECRET}"
+
+  # Token 获取路径
+  path_token: "/iuap-api-auth/open-auth/selfAppAuth/getAccessToken"
+
+  # 超时配置（秒）
+  http_timeout_seconds: 30
+
+  # TLS 配置
+  insecure_tls: false
+
+  # Token 缓存策略
+  token_refresh_skew_seconds: 120
+  token_fallback_ttl_seconds: 3500
+
+# 事件查询 API 配置
+event_query:
+  # 事件类型列表查询
+  # 注意：路径中包含 tenant_id，与实际调用保持一致
+  list_path: "/iuap-api-gateway/{tenantId}/{sysId}/AW/list/event"
+  list_method: "POST"
+
+  # 事件详情查询
+  detail_path: "/iuap-api-gateway/{tenantId}/{sysId}/AW/openPortal/event/eventDetail/{eventId}"
+  detail_method: "GET"
+
+  # 默认 tenantId（可通过环境变量 YONBIP_TENANT_ID 覆盖）
+  default_tenant_id: "ozciy868"
+
+  # 默认 sysId
+  default_sys_id: "current_yonbip_default_sys"
+
+  # 成功码
+  success_code: "200"
+
+# 输出配置
+output:
+  write_result_json: false
+  result_json_filename: "event_query_last.json"
+  format: "json"
+
+# 限流配置
+rate_limit:
+  enabled: true
+  requests_per_second: 10.0
+  burst_capacity: 20.0
+
+# 日志配置
+logging:
+  level: "${LOG_LEVEL:-INFO}"
+  format: "%(asctime)s - %(name)s - %(levelname)s - %(message)s"
+  file: ""
